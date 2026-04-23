@@ -1,1 +1,469 @@
+import os
+import sys
+import logging
+import warnings
+import math
+import shutil
+import zipfile
+import re
+import requests
+import gdown
+import gc
+from urllib.parse import urlencode, unquote 
+from pathlib import Path
+import numpy as np
+import cv2
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+from rembg import remove, new_session
+
+# --- AI SETUP ---
+warnings.filterwarnings("ignore")
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+AI_AVAILABLE = False
+try:
+    import torch
+    import torch.nn.functional as F
+    from transformers import CLIPProcessor, CLIPModel, logging as hf_logging
+    hf_logging.set_verbosity_error()
+    AI_AVAILABLE = True
+except ImportError:
+    print("AI modules not found. AI features disabled.")
+
+# ==========================================
+#        КОНФИГУРАЦИЯ (V107 - ELLIPSE PREDICTOR)
+# ==========================================
+class Config:
+    DOWNLOAD_DIR = 'downloads_temp'
+    OUTPUT_DIR = 'output_processed'
+    KNOWLEDGE_BASE_DIR = 'knowledge_base'
+    LOG_FILE = 'agent_v107.log'
+    
+    CANVAS_W = 1280
+    CANVAS_H = 840
+    PRODUCT_BG_COLOR = "#FAFAFA"
+    
+    # --- [АНАЛИЗ КОНТЕКСТА] ---
+    STRIP_WIDTH_RATIO = 0.15 
+    BG_LAPLACIAN_THRESHOLD = 32.0 
+    BG_ENTROPY_THRESHOLD = 5.2
+    
+    # --- [AI ПАРАМЕТРЫ] ---
+    AI_CONFIDENCE_THRESHOLD = 0.80
+    SIMILARITY_THRESHOLD = 0.92
+    
+    # --- [ФИЗИКА ФОНА] ---
+    WHITE_PEAK_THRESHOLD = 230
+    MAX_SATURATION_THRESHOLD = 15 
+    HIST_SPIKE_MIN = 0.75 
+    
+    # --- [ГЕОМЕТРИЯ ТАРЕЛОК] ---
+    PLATE_SOLIDITY_MIN = 0.93
+    PLATE_CIRCULARITY_MIN = 0.74
+    PLATE_RIM_SENSITIVITY = 8 # Чувствительность к микро-градиенту ободка
+    
+    # --- [ВИЗУАЛ] ---
+    FINAL_SHARPNESS = 1.15
+    FINAL_CONTRAST = 1.05
+    
+    # --- [ФОРМЫ И ПОРОГИ (V63/V97)] ---
+    BOTTLE_MAX_ASPECT_RATIO = 0.65
+    BOTTLE_NECK_THRESHOLD = 0.82
+    THIN_ASPECT_THRESHOLD = 0.45   
+    NORMAL_ASPECT_THRESHOLD = 1.15 
+    LONG_ASPECT_THRESHOLD = 1.75    
+    SMALL_COVERAGE_THRESHOLD = 0.15
+
+    # --- [ОТСТУПЫ] ---
+    MARGINS_PRODUCT = {
+        "THIN_VERT":     {"top": 90, "bottom": 90, "side": 430}, 
+        "THICK_VERT":    {"top": 350, "bottom": 350, "side": 400}, 
+        "THIN_BOTTLE":   {"top": 60, "bottom": 60, "side": 430}, 
+        "THICK_BOTTLE":  {"top": 60, "bottom": 60, "side": 350}, 
+        "SMALL_SQUARE":  {"top": 350, "bottom": 350, "side": 400}, 
+        "NORMAL_SQUARE": {"top": 180, "bottom": 180, "side": 180},   
+        "SHORT_HORIZ":   {"top": 140, "bottom": 140, "side": 280}, 
+        "NORMAL_HORIZ":  {"top": 350, "bottom": 350, "side": 400}, 
+        "LONG_HORIZ":    {"top": 160, "bottom": 160, "side": 100}, 
+        "DEFAULT":       {"top": 85, "bottom": 85, "side": 300}
+    }
+    MARGINS_PLATE = {"top": 350, "bottom": 350, "side": 400}
+    MARGINS_LIFESTYLE = {"top": 0, "bottom": 0, "side": 0}
+
+# ==========================================
+#           СИСТЕМНЫЕ ФУНКЦИИ
+# ==========================================
+def setup_logging():
+    logger = logging.getLogger("AgentV107")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False 
+    if logger.hasHandlers(): logger.handlers.clear()
+    formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%H:%M:%S')
+    fh = logging.FileHandler(Config.LOG_FILE, mode='w', encoding='utf-8')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+    logger.info("=== AGENT STARTED V107 (ELLIPSE PREDICTOR) ===")
+    return logger
+
+log = None
+
+class NameGenerator:
+    @staticmethod
+    def extract_article(text):
+        """Логика V97: поиск цифр в любом месте строки"""
+        match_long = re.search(r'(\d{4,10})', text)
+        if match_long: return match_long.group(1)
+        match_any = re.search(r'(\d+)', text)
+        if match_any: return match_any.group(1)
+        clean = re.sub(r'[^\w\-]', '_', text)
+        return clean if clean else "unknown"
+
+class Brain:
+    def __init__(self):
+        self.model = None; self.processor = None
+        self.knowledge_base = {"PLATE": [], "PRODUCT": [], "LIFESTYLE": []}
+        if AI_AVAILABLE:
+            try:
+                self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+                self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+                self.load_knowledge_base()
+            except Exception as e: log.error(f"AI Brain Error: {e}")
+
+    def _safe_normalize(self, embed):
+        if not isinstance(embed, torch.Tensor):
+            if hasattr(embed, 'image_embeds'): embed = embed.image_embeds
+            elif hasattr(embed, 'pooler_output'): embed = embed.pooler_output
+            else:
+                try: embed = torch.tensor(embed)
+                except: return None
+        return F.normalize(embed, p=2, dim=-1)
+
+    def load_knowledge_base(self):
+        if not os.path.exists(Config.KNOWLEDGE_BASE_DIR):
+            for k in self.knowledge_base: os.makedirs(os.path.join(Config.KNOWLEDGE_BASE_DIR, k), exist_ok=True)
+            return
+        c = 0
+        for label in self.knowledge_base:
+            folder = os.path.join(Config.KNOWLEDGE_BASE_DIR, label)
+            if not os.path.exists(folder): continue
+            for fname in os.listdir(folder):
+                if fname.lower().endswith(('jpg','png','jpeg','webp')):
+                    try:
+                        img = Image.open(os.path.join(folder, fname)).convert("RGB")
+                        inputs = self.processor(images=img, return_tensors="pt")
+                        with torch.no_grad(): raw = self.model.get_image_features(**inputs)
+                        embed = self._safe_normalize(raw)
+                        if embed is not None: self.knowledge_base[label].append(embed); c+=1
+                    except: pass
+        log.info(f"Knowledge Base: {c} cases ready.")
+
+    def predict_context_strip(self, strip_pil):
+        if self.model is None: return 0.5
+        labels = ["solid empty studio background", "textured interior lifestyle surface"]
+        inputs = self.processor(text=labels, images=strip_pil, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            probs = self.model(**inputs).logits_per_image.softmax(dim=1).numpy()[0]
+        return probs[0]
+
+    def predict_full(self, image_pil):
+        if self.model is None: return "PRODUCT", 0.0, "NO_AI"
+        inputs = self.processor(images=image_pil, return_tensors="pt")
+        with torch.no_grad(): raw = self.model.get_image_features(**inputs)
+        img_embed = self._safe_normalize(raw)
+        
+        best_sim = -1.0; best_lbl = None
+        for lbl, embeds in self.knowledge_base.items():
+            for ref in embeds:
+                sim = torch.mm(img_embed, ref.T).item()
+                if sim > best_sim: best_sim = sim; best_lbl = lbl
+        if best_sim > Config.SIMILARITY_THRESHOLD: return best_lbl, best_sim, "KB_MATCH"
+
+        labels = ["PRODUCT", "PLATE", "LIFESTYLE"]
+        prompts = ["a packaged commercial product", "a food plate top view", "lifestyle food interior decorations"]
+        inputs = self.processor(text=prompts, images=image_pil, return_tensors="pt", padding=True)
+        with torch.no_grad():
+            probs = self.model(**inputs).logits_per_image.softmax(dim=1).numpy()[0]
+        idx = np.argmax(probs)
+        return labels[idx], float(probs[idx]), "ZERO_SHOT"
+
+class DownloadManager:
+    @staticmethod
+    def download_and_extract(url, dest):
+        os.makedirs(dest, exist_ok=True)
+        archive_path = os.path.join(dest, "archive.zip")
+        try:
+            dl_url = url
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            if "disk.yandex" in url or "yadi.sk" in url:
+                api = 'https://cloud-api.yandex.net/v1/disk/public/resources/download?' + urlencode({'public_key': url})
+                r = requests.get(api, headers=headers)
+                if r.status_code == 200: dl_url = r.json().get('href')
+            elif "drive.google.com" in url:
+                gdown.download(url, output=archive_path, quiet=False, fuzzy=True)
+                dl_url = None
+            if dl_url:
+                with requests.get(dl_url, stream=True, headers=headers) as r:
+                    r.raise_for_status()
+                    with open(archive_path, 'wb') as f: shutil.copyfileobj(r.raw, f)
+            
+            with zipfile.ZipFile(archive_path, 'r') as zf:
+                for member in zf.infolist():
+                    try: member.filename = member.filename.encode('cp437').decode('cp866')
+                    except: pass
+                    safe_name = member.filename.replace('\t', ' ').replace('\n', '').replace('\r', '')
+                    safe_name = re.sub(r'[<>:"/\\|?*]', '_', safe_name).strip()
+                    if "__MACOSX" in safe_name: continue
+                    target = os.path.join(dest, safe_name)
+                    if member.is_dir(): os.makedirs(target, exist_ok=True)
+                    else:
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        with zf.open(member) as s, open(target, 'wb') as t: shutil.copyfileobj(s, t)
+            return True
+        except Exception as e:
+            log.error(f"DL error: {e}"); return False
+
+# ==========================================
+#           АНАЛИТИЧЕСКИЙ ДВИЖОК
+# ==========================================
+class GeometryExpert:
+    @staticmethod
+    def get_bboxes(pil_orig, pil_mask, model_type):
+        W, H = pil_orig.size
+        mask_arr = np.array(pil_mask.convert("L"))
+        
+        # Эрозия для удаления "шумных" пикселей маски
+        kernel = np.ones((5,5), np.uint8)
+        mask_clean = cv2.erode(mask_arr, kernel, iterations=1)
+        
+        cnts, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        core_bbox = (0,0,W,H); solidity = 0.0; circularity = 0.0
+        
+        if cnts:
+            c = max(cnts, key=cv2.contourArea)
+            area = cv2.contourArea(c)
+            hull = cv2.convexHull(c)
+            solidity = area / cv2.contourArea(hull) if cv2.contourArea(hull) > 0 else 0
+            peri = cv2.arcLength(c, True)
+            circularity = (4 * math.pi * area) / (peri * peri) if peri > 0 else 0
+            x,y,w,h = cv2.boundingRect(c); core_bbox = (x,y,x+w,y+h)
+        
+        # Если это тарелка - запускаем ГЕОМЕТРИЧЕСКУЮ РЕКОНСТРУКЦИЮ
+        if model_type == 'PLATE':
+            full_bbox = GeometryExpert._reconstruct_ellipse(pil_orig, core_bbox)
+        else:
+            full_bbox = core_bbox # Для продуктов берем маску
+            
+        return core_bbox, full_bbox, solidity, circularity
+
+    @staticmethod
+    def _reconstruct_ellipse(pil_orig, core_bbox):
+        """
+        Ищет дуги тарелки и достраивает из них идеальный эллипс.
+        Убирает зависимость от 'белого на белом'.
+        """
+        W, H = pil_orig.size
+        cv_img = cv2.cvtColor(np.array(pil_orig), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        
+        # 1. Усиление локальных теней (края тарелки всегда чуть темнее фона)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        cl_gray = clahe.apply(gray)
+        
+        # 2. Поиск краев (Canny)
+        edges = cv2.Canny(cl_gray, Config.PLATE_RIM_SENSITIVITY, Config.PLATE_RIM_SENSITIVITY*3)
+        
+        # 3. Фильтрация точек: берем только те, что вокруг еды
+        points = np.column_stack(np.where(edges > 0))
+        if len(points) < 20: return core_bbox
+        
+        cx_food, cy_food = (core_bbox[0]+core_bbox[2])/2, (core_bbox[1]+core_bbox[3])/2
+        radius_est = max(core_bbox[2]-core_bbox[0], core_bbox[3]-core_bbox[1]) / 2
+        
+        valid_points = []
+        for p in points:
+            dist = math.hypot(p[1]-cx_food, p[0]-cy_food)
+            # Берем точки в радиусе от 0.8 до 1.5 от размера еды
+            if radius_est * 0.8 < dist < radius_est * 1.8:
+                valid_points.append((p[1], p[0])) # OpenCV format (x, y)
+        
+        if len(valid_points) < 15: 
+            # Если не нашли дуги, просто расширяем маску еды на 18% как сейф-зону
+            x1,y1,x2,y2 = core_bbox
+            pw, ph = (x2-x1)*0.18, (y2-y1)*0.18
+            return (max(0,int(x1-pw)), max(0,int(y1-ph)), min(W,int(x2+pw)), min(H,int(y2+ph)))
+
+        # 4. Fit Ellipse (Математическое достроение овала по точкам)
+        try:
+            ellipse = cv2.fitEllipse(np.array(valid_points, dtype=np.float32))
+            (ex, ey), (ew, eh), angle = ellipse
+            
+            # Проверка адекватности эллипса
+            if ew > W or eh > H or ew < (core_bbox[2]-core_bbox[0]):
+                 raise ValueError("Ellipse too big/small")
+            
+            nx1 = max(0, int(ex - ew/2))
+            ny1 = max(0, int(ey - eh/2))
+            nx2 = min(W, int(ex + ew/2))
+            ny2 = min(H, int(ey + eh/2))
+            return (nx1, ny1, nx2, ny2)
+        except:
+            # Fallback к расширению
+            x1,y1,x2,y2 = core_bbox
+            pw, ph = (x2-x1)*0.18, (y2-y1)*0.18
+            return (max(0,int(x1-pw)), max(0,int(y1-ph)), min(W,int(x2+pw)), min(H,int(y2+ph)))
+
+class ProcessorV107:
+    def __init__(self):
+        self.session = new_session("isnet-general-use")
+        self.brain = Brain()
+
+    def process(self, image_path):
+        filename = os.path.basename(image_path)
+        log.info(f"--- Analyzing: {filename} ---")
+        try:
+            orig = Image.open(image_path).convert("RGBA")
+            orig = ImageOps.exif_transpose(orig)
+            orig_rgb = orig.convert("RGB")
+            W, H = orig.size
+            
+            # Анализ фона по краям
+            sw = int(W * Config.STRIP_WIDTH_RATIO)
+            strip_l = orig_rgb.crop((0, 0, sw, H))
+            strip_r = orig_rgb.crop((W - sw, 0, W, H))
+            
+            cv_l = cv2.cvtColor(np.array(strip_l), cv2.COLOR_RGB2GRAY)
+            cv_r = cv2.cvtColor(np.array(strip_r), cv2.COLOR_RGB2GRAY)
+            lap_var = np.mean([cv2.Laplacian(cv_l, cv2.CV_64F).var(), cv2.Laplacian(cv_r, cv2.CV_64F).var()])
+            
+            ai_lbl, ai_conf, ai_src = self.brain.predict_full(orig_rgb)
+            try: mask_img = remove(orig, session=self.session, only_mask=True)
+            except: mask_img = Image.new("L", (W,H), 0)
+
+            # --- DECISION ---
+            model_type = ai_lbl
+            if ai_src != "KB_MATCH":
+                if lap_var > Config.BG_LAPLACIAN_THRESHOLD: 
+                    model_type = "LIFESTYLE"
+                elif ai_lbl == "PLATE":
+                    _, _, sol, circ = GeometryExpert.get_bboxes(orig_rgb, mask_img, 'PLATE')
+                    if sol < Config.PLATE_SOLIDITY_MIN or circ < Config.PLATE_CIRCULARITY_MIN:
+                        model_type = "PRODUCT"
+                elif ai_conf < Config.AI_CONFIDENCE_THRESHOLD:
+                    model_type = "PRODUCT"
+
+            c_bbox, f_bbox, sol, circ = GeometryExpert.get_bboxes(orig_rgb, mask_img, model_type)
+            
+            # Форма
+            x1,y1,x2,y2 = c_bbox
+            ar = (x2-x1)/max(1, (y2-y1))
+            shape = "DEFAULT"
+            if ar < Config.NORMAL_ASPECT_THRESHOLD: shape = "THIN_VERT" if ar < 0.5 else "THICK_VERT"
+            elif ar > Config.LONG_ASPECT_THRESHOLD: shape = "LONG_HORIZ"
+            else: shape = "NORMAL_HORIZ"
+            
+            log.info(f"  > Decision: {model_type} | Shape: {shape} | Lap: {lap_var:.1f}")
+
+            # --- SCALING & CENTERING ---
+            cw, ch = Config.CANVAS_W, Config.CANVAS_H
+            target_bbox = f_bbox if model_type == 'PLATE' else c_bbox
+            margins = Config.MARGINS_PLATE if model_type == 'PLATE' else \
+                      (Config.MARGINS_PRODUCT.get(shape, Config.MARGINS_PRODUCT["DEFAULT"]) if model_type == 'PRODUCT' else Config.MARGINS_LIFESTYLE)
+
+            tx1, ty1, tx2, ty2 = target_bbox
+            tw, th = max(1, tx2-tx1), max(1, ty2-ty1)
+            
+            if model_type == 'LIFESTYLE':
+                scale = max(cw/W, ch/H) * 1.3
+            else:
+                scale = min((cw - margins['side']*2)/tw, (ch - (margins['top']+margins['bottom']))/th)
+                if model_type == 'PLATE': scale *= 0.98
+
+            fw, fh = int(W*scale), int(H*scale)
+            resized = orig_rgb.resize((fw, fh), Image.LANCZOS)
+            
+            # ПРЕЦИЗИОННОЕ ЦЕНТРИРОВАНИЕ (EQUALIZER MATH)
+            pad_x = (cw - (tw * scale)) / 2
+            pad_y = (ch - (th * scale)) / 2
+            shift_x = int(pad_x - (tx1 * scale))
+            shift_y = int(pad_y - (ty1 * scale))
+
+            if model_type == 'LIFESTYLE':
+                shift_x = max(min(0, shift_x), cw - fw); shift_y = max(min(0, shift_y), ch - fh)
+
+            if model_type == 'LIFESTYLE':
+                canvas = resized.resize((cw, ch), Image.BICUBIC).filter(ImageFilter.GaussianBlur(100))
+            else:
+                canvas = Image.new("RGB", (cw, ch), Config.PRODUCT_BG_COLOR)
+            
+            canvas.paste(resized, (shift_x, shift_y))
+            canvas = ImageEnhance.Sharpness(canvas).enhance(Config.FINAL_SHARPNESS)
+            canvas = ImageEnhance.Contrast(canvas).enhance(Config.FINAL_CONTRAST)
+            
+            del resized, orig, orig_rgb, mask_img
+            gc.collect()
+            return canvas, model_type
+        except Exception as e:
+            log.error(f"Error {filename}: {e}", exc_info=True); return None, None
+
+def main():
+    global log
+    log = setup_logging()
+    print("\n=== AI PHOTO AGENT V107 (ELLIPSE) ===")
+    print("Paste links (one per line, empty line to start):")
+    links = []
+    while True:
+        l = input("Link: ").strip()
+        if not l: break
+        links.append(l)
+    
+    if not links: return
+    processor = ProcessorV107()
+    os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
+    
+    for url in links:
+        if os.path.exists(Config.DOWNLOAD_DIR): shutil.rmtree(Config.DOWNLOAD_DIR)
+        DownloadManager.download_and_extract(url, Config.DOWNLOAD_DIR)
+        
+        batches = {}
+        for r, d, f in os.walk(Config.DOWNLOAD_DIR):
+            img_files = [file for file in f if file.lower().endswith(('.jpg','.png','.jpeg','.webp'))]
+            if not img_files: continue
+            folder_name = os.path.basename(r)
+            for img in img_files:
+                # Naming Logic V97
+                if r != Config.DOWNLOAD_DIR and re.search(r'\d', folder_name):
+                    art = NameGenerator.extract_article(folder_name)
+                else:
+                    art = NameGenerator.extract_article(img)
+                if art not in batches: batches[art] = []
+                batches[art].append(os.path.join(r, img))
+        
+        for art, paths in batches.items():
+            log.info(f"--- Processing Batch: {art} ---")
+            results = []
+            for p in paths:
+                res, mtype = processor.process(p)
+                if res: results.append({'img': res, 'type': mtype})
+            
+            type_order = {'PLATE': '_1', 'PRODUCT': '_2', 'LIFESTYLE': '_3'}
+            for item in results: item['pref'] = type_order.get(item['type'], '_0')
+            sorted_res = sorted(results, key=lambda x: x['pref'])
+            counts = {'_1': 0, '_2': 0, '_3': 0}
+            for item in sorted_res:
+                p = item['pref']
+                counts[p] += 1
+                suffix = "" if counts[p] == 1 else f"({counts[p]-1})"
+                out_name = f"{art}{p}{suffix}.png"
+                item['img'].save(os.path.join(Config.OUTPUT_DIR, out_name))
+                log.info(f"  > Saved: {out_name} [{item['type']}]")
+
+    try: shutil.rmtree(Config.DOWNLOAD_DIR)
+    except: pass
+    input("\nDone. Press Enter to Exit...")
+
+if __name__ == "__main__":
+    main()
+
 
