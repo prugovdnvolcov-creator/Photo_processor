@@ -2,11 +2,13 @@
 AI Brain module for image context detection and classification.
 
 Uses CLIP model for zero-shot classification and knowledge base matching.
+Implements singleton pattern for model caching to avoid redundant loading.
 """
 
 import logging
 import os
 from typing import List, Tuple, Optional, Dict, Any
+from threading import Lock
 
 import numpy as np
 from PIL import Image
@@ -25,12 +27,94 @@ except ImportError:
     logger.warning("AI modules not found. AI features disabled.")
 
 
+class ModelCache:
+    """
+    Singleton cache for AI models to prevent redundant loading.
+    
+    Thread-safe implementation that ensures only one instance
+    of each model is loaded across all Brain instances.
+    """
+    _instance: Optional['ModelCache'] = None
+    _lock = Lock()
+    
+    def __new__(cls) -> 'ModelCache':
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+        self._models: Dict[str, Tuple[Any, Any]] = {}
+        self._initialized = True
+    
+    def get_model(self, model_name: str, cache_dir: Optional[str] = None) -> Tuple[Optional[Any], Optional[Any]]:
+        """
+        Get or load a CLIP model and processor.
+        
+        Args:
+            model_name: HuggingFace model identifier
+            cache_dir: Optional custom cache directory
+            
+        Returns:
+            Tuple of (model, processor) or (None, None) if unavailable
+        """
+        if not AI_AVAILABLE:
+            return None, None
+        
+        cache_key = f"{model_name}:{cache_dir}"
+        
+        if cache_key in self._models:
+            logger.debug(f"Using cached model: {model_name}")
+            return self._models[cache_key]
+        
+        try:
+            logger.info(f"Loading AI model: {model_name}")
+            model_kwargs = {}
+            if cache_dir:
+                model_kwargs['cache_dir'] = cache_dir
+            
+            model = CLIPModel.from_pretrained(model_name, **model_kwargs)
+            processor = CLIPProcessor.from_pretrained(model_name, **model_kwargs)
+            
+            # Move to GPU if available and enabled
+            from photo_agent.src.core.config import Config
+            if Config.ENABLE_AI and Config.PERFORMANCE.ENABLE_GPU and torch.cuda.is_available():
+                model = model.to('cuda')
+                logger.info("Model loaded on GPU")
+            elif Config.ENABLE_AI and torch.cuda.is_available():
+                model = model.to('cuda')
+                logger.info("Model loaded on GPU")
+            else:
+                logger.info("Model loaded on CPU")
+            
+            self._models[cache_key] = (model, processor)
+            return model, processor
+            
+        except Exception as e:
+            logger.error(f"Failed to load model {model_name}: {e}")
+            return None, None
+    
+    def clear_cache(self) -> None:
+        """Clear all cached models and free memory."""
+        import gc
+        with self._lock:
+            self._models.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+
 class Brain:
     """
     AI-powered image analysis engine.
     
     Provides context detection, classification, and similarity matching
     using CLIP model and a knowledge base of reference images.
+    Uses ModelCache singleton for efficient model reuse.
     """
     
     def __init__(self, knowledge_base_dir: str = "knowledge_base"):
@@ -49,13 +133,23 @@ class Brain:
             self._initialize_model()
     
     def _initialize_model(self) -> None:
-        """Load CLIP model and processor."""
+        """Load CLIP model from cache or initialize new instance."""
         try:
             from photo_agent.src.core.config import Config
-            self.model = CLIPModel.from_pretrained(Config.AI_MODEL_NAME)
-            self.processor = CLIPProcessor.from_pretrained(Config.AI_MODEL_NAME)
-            self._load_knowledge_base()
-            logger.info("AI Brain initialized successfully")
+            
+            if not Config.ENABLE_AI:
+                logger.info("AI is disabled by configuration")
+                return
+            
+            cache = ModelCache()
+            self.model, self.processor = cache.get_model(
+                Config.AI_MODEL_NAME, 
+                Config.AI_CACHE_DIR
+            )
+            
+            if self.model is not None:
+                self._load_knowledge_base()
+                logger.info("AI Brain initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize AI Brain: {e}")
             self.model = None
