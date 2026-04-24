@@ -1,0 +1,102 @@
+name: Photo Agent Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: 'Имя файла изображения для обработки (должно быть в папке input/)'
+        required: true
+        default: 'image.jpg'
+      python_version:
+        description: 'Версия Python'
+        required: false
+        default: '3.11'
+
+jobs:
+  run-photo-agent:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ github.event.inputs.python_version }}
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        else
+          echo "requirements.txt не найден. Пропускаем установку зависимостей."
+        fi
+
+    - name: Create directories
+      run: |
+        mkdir -p photo_agent/input photo_agent/output
+
+    - name: Upload test image (if no real image provided)
+      run: |
+        # Если у вас нет реального изображения в репозитории, создадим тестовое
+        # В реальном сценарии вы должны закоммитить изображения в папку input/
+        if [ ! -f "photo_agent/input/${{ github.event.inputs.image_name }}" ]; then
+          echo "⚠️ Файл ${{ github.event.inputs.image_name }} не найден в input/"
+          echo "Создаем тестовое изображение..."
+          python -c "
+from PIL import Image
+import os
+img = Image.new('RGB', (800, 600), color='blue')
+os.makedirs('photo_agent/input', exist_ok=True)
+img.save('photo_agent/input/${{ github.event.inputs.image_name }}')
+print('Тестовое изображение создано')
+" || echo "PIL не установлен, пропускаем создание тестового изображения"
+        fi
+
+    - name: List input files
+      run: |
+        echo "Файлы в input/:"
+        ls -la photo_agent/input/ || true
+
+    - name: Run Photo Agent
+      run: |
+        # Замените команду на вашу основную точку входа
+        # Вариант 1: Если есть основной скрипт
+        if [ -f "main.py" ]; then
+          python main.py --input "photo_agent/input/${{ github.event.inputs.image_name }}" --output "photo_agent/output"
+        # Вариант 2: Если это пакет
+        elif [ -f "photo_agent/__main__.py" ]; then
+          python -m photo_agent --input "photo_agent/input/${{ github.event.inputs.image_name }}" --output "photo_agent/output"
+        # Вариант 3: Поиск любого Python файла
+        else
+          MAIN_SCRIPT=$(find . -maxdepth 2 -name "*.py" -not -path "./.*" | head -1)
+          if [ -n "$MAIN_SCRIPT" ]; then
+            echo "Запускаем: $MAIN_SCRIPT"
+            python "$MAIN_SCRIPT" --input "photo_agent/input/${{ github.event.inputs.image_name }}" --output "photo_agent/output" || echo "Скрипт завершился с ошибкой или не поддерживает эти аргументы"
+          else
+            echo "❌ Python скрипты не найдены"
+            exit 1
+          fi
+        fi
+
+    - name: List output files
+      run: |
+        echo "Файлы в output/:"
+        ls -la photo_agent/output/ || true
+
+    - name: Upload results
+      uses: actions/upload-artifact@v4
+      with:
+        name: photo-agent-results
+        path: photo_agent/output/
+        retention-days: 7
+        if-no-files-found: warn
+
+    - name: Show completion message
+      run: |
+        echo "✅ Обработка завершена!"
+        echo "Результаты доступны в артефактах 'photo-agent-results'"
+        echo "Скачайте их на странице запуска Actions"
